@@ -194,11 +194,25 @@ def main():
 
     latest_log = latest(glob.glob(os.path.join(LOG_DIR, "*.log")))
     errors = []
+    fallback_models = set()
+    batch_count = bubble_count = 0
     if latest_log:
         with open(latest_log, encoding="utf-8", errors="replace") as f:
             for line in f:
                 if "level=ERROR" in line:
                     errors.append(line.strip())
+                if 'level=WARN msg="codexSession: item error"' in line:
+                    match = re.search(r"Model metadata for `([A-Za-z0-9._-]+)` not found\. Defaulting to fallback metadata", line)
+                    if match:
+                        fallback_models.add(match[1])
+                if 'level=INFO msg="weixin chat input batched"' in line:
+                    match = re.search(r"\bmessages=(\d+)(?=\s|$)", line)
+                    if match:
+                        batch_count += 1
+                        bubble_count += int(match[1])
+        print(f"[INFO] 本次运行微信连发合并: {batch_count} 组 / {bubble_count} 条")
+    if fallback_models:
+        print("[WARN] Codex 模型元数据使用备用配置: " + ", ".join(sorted(fallback_models)))
     print(f"[{'OK' if not errors else '!!'}] 最近日志错误: {len(errors)}")
     if errors:
         print("    " + errors[-1][:200])
