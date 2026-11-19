@@ -1,6 +1,6 @@
-# Ball Ball Companion
+# Orby
 
-当前稳定版：[v0.3.1](https://github.com/wuhongwei-szu/ball-ball-companion/releases/tag/v0.3.1) · [更新日志](CHANGELOG.md)
+当前稳定版：[v0.3.1](https://github.com/wuhongwei-szu/orby/releases/tag/v0.3.1) · [更新日志](CHANGELOG.md)
 
 一个可自托管的微信 AI 陪伴机器人：**两个微信 bot、共享人格与长期记忆、自然多气泡、表情包、一次性提醒、上下文关怀**。
 
@@ -107,7 +107,7 @@ work_dir/
 
    ```bash
    mkdir C:\ai-companion
-   git clone https://github.com/wuhongwei-szu/ball-ball-companion.git C:\ai-companion
+   git clone https://github.com/wuhongwei-szu/orby.git C:\ai-companion
    ```
 
 3. **配置两个微信 ilink bot**
