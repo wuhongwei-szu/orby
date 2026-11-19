@@ -164,6 +164,12 @@ work_dir/
 
 ### 多条短消息与表情
 
+微信连发修复由 `deploy/cc-connect-weixin-chat-burst.patch` 提供，基于已经应用材料队列和静默会话重置补丁的 Go 源码。已确认账号的同一私聊中，普通短文本从首条起等待最多 2.4 秒，每批最多 6 条，保留各条原文及其来源。验证命令为 `go test ./core ./platform/weixin -run 'TestWeixin|TestOrderedDirectInbox|TestPlainItem'`，健康检查统计最新进程的合并组数与条数。
+
+明确委托的跨会话表情用 `send_sticker.py master|xi --relay --id <ID>`。自己生成的图片用 `send_msg.py master|xi --image <路径>`，明确跨会话时加 `--relay`。这两个入口都只提交图片，接口回执和对方确认分开记录。
+
+设计参考 [OpenClaw 的会话内连发处理](https://github.com/openclaw/openclaw/blob/1fc5296cba84c80cfe23321cba053caf3bcda75f/src/auto-reply/inbound-debounce.ts) 和 [Signal Desktop 的发送状态定义](https://github.com/signalapp/Signal-Desktop/blob/848443afc3fcc74a0e127ba4f4d8554b95da856e/ts/messages/MessageSendState.std.ts)。
+
 机器人优先用 `chat_burst.py` 发 1-3 条短消息，中间随机停顿；可在最后附一张本地表情：
 
 ```bash
