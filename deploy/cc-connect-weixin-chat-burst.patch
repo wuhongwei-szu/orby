@@ -1,0 +1,1326 @@
+diff --git a/core/engine.go b/core/engine.go
+index dc1411b..aaadcca 100644
+--- a/core/engine.go
++++ b/core/engine.go
+@@ -346,6 +346,7 @@ type RateLimitCfg struct {
+ 
+ // Engine routes messages between platforms and the agent for a single project.
+ type Engine struct {
++	weixinChatLanes       sync.Map // keyed by configured account, DM and sender
+ 	name                  string
+ 	agent                 Agent
+ 	platforms             []Platform
+@@ -517,6 +518,7 @@ type queuedMessage struct {
+ 	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+ 	material          bool
+ 	materialParts     []queuedMessage // separate source records for a same-identity batch
++	weixinChatTicket  weixinChatTicket
+ }
+ 
+ // interactiveState tracks a running interactive agent session and its permission state.
+@@ -2786,7 +2788,21 @@ func (e *Engine) startMessageRecallMonitor(sessionKey string) context.CancelFunc
+ }
+ 
+ func (e *Engine) handleMessage(p Platform, msg *Message) {
++	lane := e.directWeixinChatLane(p, msg)
++	if lane != nil {
++		lane.mu.Lock()
++		defer lane.mu.Unlock()
++		if e.ctx.Err() != nil {
++			return
++		}
++		msg.weixinChatTicket = weixinChatTicket{lane: lane, generation: lane.generation.Load()}
++	}
++	e.handleMessageInLane(p, msg, lane)
++}
++
++func (e *Engine) handleMessageInLane(p Platform, msg *Message, lane *weixinChatLane) {
+ 	if msg.Recalled {
++		lane.retract(msg.MessageID)
+ 		e.handleMessageRecall(p, msg)
+ 		return
+ 	}
+@@ -2818,6 +2834,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 
+ 	// Voice message: transcribe to text first
+ 	if msg.Audio != nil {
++		lane.flush(e, p)
+ 		// If STT is configured, use it for transcription (more accurate)
+ 		if e.speech.Enabled && e.speech.STT != nil {
+ 			e.handleVoiceMessage(p, msg)
+@@ -2961,6 +2978,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 
+ 	// Permission responses bypass the session lock.
+ 	// Must be after workspace resolution so interactiveKey is correct.
++	if lane != nil && lane.pending != nil {
++		if _, permission := e.lookupPending(interactiveKey); permission != nil || msg.IsPermissionResponse {
++			lane.flush(e, p)
++		}
++	}
+ 	if e.handlePendingPermission(p, msg, content, interactiveKey) {
+ 		return
+ 	}
+@@ -2970,6 +2992,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 	if len(msg.Images) == 0 && strings.HasPrefix(content, "!") {
+ 		shellCmd := strings.TrimSpace(content[1:])
+ 		if shellCmd != "" {
++			lane.flush(e, p)
+ 			// Check disabled / admin just like handleCommand does for "shell"
+ 			e.userRolesMu.RLock()
+ 			disabledCmds := e.disabledCmds
+@@ -2998,6 +3021,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 
+ 	// Pending provider add (card-driven multi-step flow)
+ 	if e.handlePendingProviderAdd(p, msg, content, interactiveKey) {
++		lane.flush(e, p)
+ 		return
+ 	}
+ 
+@@ -3005,7 +3029,17 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
+ 	if e.discardStaleUserMessageIfNeeded(interactiveKey, msg) {
+ 		return
+ 	}
++	if lane != nil && isWeixinChatBubble(msg) {
++		lane.add(e, p, msg, func(input *Message) {
++			e.dispatchAdmittedMessage(p, input, sessions, agent, interactiveKey, resolvedWorkspace)
++		})
++		return
++	}
++	lane.flush(e, p)
++	e.dispatchAdmittedMessage(p, msg, sessions, agent, interactiveKey, resolvedWorkspace)
++}
+ 
++func (e *Engine) dispatchAdmittedMessage(p Platform, msg *Message, sessions *SessionManager, agent Agent, interactiveKey, resolvedWorkspace string) {
+ 	session := sessions.GetOrCreateActive(msg.SessionKey)
+ 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+ 	// Ensure an interactiveState entry exists before taking the session lock.
+@@ -3152,7 +3186,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
+ 	// current turn, causing the event loop to hang waiting for a second
+ 	// EventResult that never arrives. Instead, the event loop sends the
+ 	// message after the current turn's EventResult is received.
+-	material := msg.materialInput || materialInputLocked(state, p, msg)
++	material := len(msg.weixinChatParts) == 0 && (msg.materialInput || materialInputLocked(state, p, msg))
+ 	if !material && e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
+ 		snap := userMessageWatermarkSnapshotLocked(state)
+ 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
+@@ -3697,25 +3731,44 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 		}
+ 	}()
+ 
+-	if e.ctx.Err() != nil {
++	ticket := msg.weixinChatTicket
++	if e.ctx.Err() != nil || !ticket.current() {
+ 		return
+ 	}
+ 
+ 	turnStart := time.Now()
+ 
+-	e.i18n.DetectAndSet(msg.Content)
+-	session.AddHistory("user", msg.Content)
++	if lane := ticket.lane; lane != nil {
++		lane.mu.Lock()
++		if !ticket.current() {
++			lane.mu.Unlock()
++			return
++		}
++	}
++	if len(msg.weixinChatParts) != 0 {
++		e.i18n.DetectAndSet(msg.SourceUserContent)
++		queuedMessage{materialParts: msg.weixinChatParts}.addChatHistory(session)
++	} else {
++		e.i18n.DetectAndSet(msg.Content)
++		session.AddHistory("user", msg.Content)
++	}
+ 	// Persist user message immediately so crashes between user input and
+ 	// assistant reply don't lose it (the assistant-side Save below depends
+ 	// on the turn completing without a process crash).
+ 	sessions.Save()
++	if lane := ticket.lane; lane != nil {
++		lane.mu.Unlock()
++	}
+ 
+ 	// Use the agent override when available (multi-workspace mode)
+ 	var agentOverride Agent
+ 	if agent != e.agent {
+ 		agentOverride = agent
+ 	}
+-	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
++	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey, ticket)
++	if state == nil || !ticket.current() {
++		return
++	}
+ 
+ 	// Set workspaceDir on the state for idle reaper identification
+ 	if workspaceDir != "" {
+@@ -3726,6 +3779,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 
+ 	// Update reply context for this turn
+ 	state.mu.Lock()
++	as := state.agentSession
+ 	if state.currentMessageID != msg.MessageID {
+ 		state.lastRecallProbeMessageID = ""
+ 		state.lastRecallProbeAt = time.Time{}
+@@ -3743,8 +3797,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
+ 	defer stopRecallMonitor()
+ 
+-	if state.agentSession == nil {
+-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
++	if as == nil {
++		if ticket.current() {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
++		}
+ 		return
+ 	}
+ 	e.cancelAgentSessionIdleClose(state)
+@@ -3758,7 +3814,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	// Apply per-message permission mode override (e.g. cron jobs with mode = "bypassPermissions").
+ 	// Defer restores only when SetLiveMode succeeds for the override.
+ 	if msg.ModeOverride != "" {
+-		if switcher, ok := state.agentSession.(LiveModeSwitcher); ok {
++		if switcher, ok := as.(LiveModeSwitcher); ok {
+ 			if switcher.SetLiveMode(msg.ModeOverride) {
+ 				defer func() {
+ 					defaultMode := "default"
+@@ -3796,18 +3852,25 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	needResync := state.eventsNeedResync
+ 	state.mu.Unlock()
+ 	if needResync {
+-		drainEvents(state.agentSession.Events())
++		drainEvents(as.Events())
+ 	}
+ 
+ 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+-	promptContent = e.appendCompanionMemory(promptContent, p, msg.SessionKey, msg.UserID, msg.MessageID, msg.SourceUserContent)
++	if len(msg.weixinChatParts) != 0 {
++		promptContent = e.appendQueuedCompanionMemory(promptContent, queuedMessage{materialParts: msg.weixinChatParts})
++	} else {
++		promptContent = e.appendCompanionMemory(promptContent, p, msg.SessionKey, msg.UserID, msg.MessageID, msg.SourceUserContent)
++	}
+ 
+ 	sendStart := time.Now()
+ 	state.mu.Lock()
++	if !ticket.current() || state.stopped || state.agentSession == nil {
++		state.mu.Unlock()
++		return
++	}
+ 	state.currentMessageID = msg.MessageID
+ 	state.fromVoice = msg.FromVoice
+ 	state.sideText = ""
+-	as := state.agentSession // capture under lock to avoid race with cleanup
+ 	state.mu.Unlock()
+ 
+ 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
+@@ -3815,8 +3878,8 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
+ 	// EventPermissionRequest while blocked — the event loop must run in parallel.
+ 	sendDone := make(chan error, 1)
+ 	go func() {
+-		if as == nil {
+-			sendDone <- fmt.Errorf("agent session became nil")
++		if !ticket.current() {
++			sendDone <- errWeixinChatCancelled
+ 			return
+ 		}
+ 		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+@@ -3996,10 +4059,14 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
+ 
+ // When agentOverride is non-nil it is used instead of e.agent to start the session.
+ // ccSessionKey, when non-empty, is used for CC_SESSION_KEY env injection; otherwise sessionKey is used.
+-func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string) *interactiveState {
++func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent, ccSessionKey string, tickets ...weixinChatTicket) *interactiveState {
+ 	e.interactiveMu.Lock()
+ 	defer e.interactiveMu.Unlock()
+ 
++	if len(tickets) > 0 && !tickets[0].current() {
++		return nil
++	}
++
+ 	state, ok := e.interactiveStates[sessionKey]
+ 	if ok && state.agentSession != nil && state.agentSession.Alive() {
+ 		// Verify the running agent session matches the current active session.
+@@ -4794,6 +4861,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 	}()
+ 
+ 	state.mu.Lock()
++	eventAgent := state.agentSession
++	if eventAgent == nil || state.stopped {
++		state.mu.Unlock()
++		return
++	}
+ 	workspaceDir := state.workspaceDir
+ 	replyAgent := state.agent
+ 	if replyAgent == nil {
+@@ -4856,7 +4928,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 		turnDeadlineCh = turnDeadlineTimer.C
+ 	}
+ 
+-	events := state.agentSession.Events()
++	events := eventAgent.Events()
+ 	stopCh := state.stopSignal()
+ 	for {
+ 		var event Event
+@@ -4872,6 +4944,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 			}
+ 		case err := <-pendingSend:
+ 			pendingSend = nil
++			if errors.Is(err, errWeixinChatCancelled) {
++				sp.discard()
++				return
++			}
+ 			if err != nil {
+ 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
+ 				sp.discard()
+@@ -4880,7 +4956,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 					stopTyping = nil
+ 				}
+ 				e.notifyDroppedQueuedMessages(state, err)
+-				if state.agentSession == nil || !state.agentSession.Alive() {
++				if !eventAgent.Alive() {
+ 					e.cleanupInteractiveState(sessionKey, state)
+ 				}
+ 				state.mu.Lock()
+@@ -4923,7 +4999,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 		graceLoop:
+ 			for {
+ 				select {
+-				case evt, ok := <-state.agentSession.Events():
++				case evt, ok := <-events:
+ 					if !ok || (ok && evt.Done) {
+ 						// Agent exited cleanly; state is intact, resume will work.
+ 						slog.Info("agent exited gracefully after max_turn_time stop signal",
+@@ -5923,7 +5999,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 				// Drain stale events before starting the next turn. Between
+ 				// EventResult and Send(), the only buffered events would be
+ 				// stale leftovers (e.g. a deferred EventError from cmd.Wait()).
+-				drainEvents(state.agentSession.Events())
++				if !queued.weixinChatTicket.current() {
++					return
++				}
++				drainEvents(events)
+ 
+ 				if pendingSend != nil {
+ 					if err := <-pendingSend; err != nil {
+@@ -5936,12 +6015,19 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 
+ 				state.mu.Lock()
+ 				as := state.agentSession // capture under lock to avoid race with cleanup
++				stopped := state.stopped
+ 				state.mu.Unlock()
++				if as == nil || stopped || !queued.weixinChatTicket.current() {
++					return
++				}
++
++				queued.addChatHistory(session)
++				sessions.Save()
+ 
+ 				nextSend := make(chan error, 1)
+ 				go func() {
+-					if as == nil {
+-						nextSend <- fmt.Errorf("agent session became nil")
++					if !queued.weixinChatTicket.current() {
++						nextSend <- errWeixinChatCancelled
+ 						return
+ 					}
+ 					nextSend <- as.Send(queuedPrompt, queued.messageID, queued.images, queued.files)
+@@ -5950,7 +6036,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 
+ 				// Detect language now (deferred from queue time to avoid
+ 				// flipping locale while the previous turn is still running).
+-				e.i18n.DetectAndSet(queued.content)
++				e.i18n.DetectAndSet(queued.languageContent())
+ 
+ 				// Reset per-turn state for the next turn
+ 				msgID = queued.messageID
+@@ -6006,11 +6092,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 					e.send(queued.platform, queued.replyCtx, replyContent)
+ 				}
+ 
+-				session.AddHistory("user", queued.content)
+-				// Persist queued user message immediately (mirror of the
+-				// initial AddHistory("user",...) save above).
+-				sessions.Save()
+-
+ 				if idleTimer != nil {
+ 					if !idleTimer.Stop() {
+ 						select {
+@@ -6080,7 +6161,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
+ 			// Only drop queued messages if the agent session is dead.
+ 			// Some agents (e.g. Codex) emit EventError for per-turn failures
+ 			// while keeping the session alive for subsequent turns.
+-			if state.agentSession == nil || !state.agentSession.Alive() {
++			if !eventAgent.Alive() {
+ 				e.notifyDroppedQueuedMessages(state, event.Error)
+ 			}
+ 			return
+@@ -6243,6 +6324,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
+ 		}
+ 		queued := state.pendingMessages[0]
+ 		state.pendingMessages = state.pendingMessages[1:]
++		if !queued.weixinChatTicket.current() {
++			state.mu.Unlock()
++			continue
++		}
+ 		state.platform = queued.platform
+ 		state.replyCtx = queued.replyCtx
+ 		state.currentMessageID = queued.messageID
+@@ -6254,7 +6339,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
+ 		}
+ 		state.mu.Unlock()
+ 
+-		e.i18n.DetectAndSet(queued.content)
++		e.i18n.DetectAndSet(queued.languageContent())
+ 		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+ 		prompt = e.appendQueuedCompanionMemory(prompt, queued)
+ 
+@@ -6269,12 +6354,14 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
+ 
+ 		drainEvents(as.Events())
+ 
+-		session.AddHistory("user", queued.content)
++		if queued.addChatHistory(session) {
++			sessions.Save()
++		}
+ 
+ 		sendDone := make(chan error, 1)
+ 		go func() {
+-			if as == nil {
+-				sendDone <- fmt.Errorf("agent session became nil")
++			if !queued.weixinChatTicket.current() {
++				sendDone <- errWeixinChatCancelled
+ 				return
+ 			}
+ 			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
+@@ -6498,6 +6585,13 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
+ 			"project", e.name, "command", cmdID)
+ 	}
+ 
++	switch cmdID {
++	case "new", "stop", "cancel", "switch":
++		// These commands invalidate pending input once their own checks succeed.
++	default:
++		msg.weixinChatTicket.lane.flush(e, p)
++	}
++
+ 	switch cmdID {
+ 	case "new":
+ 		e.cmdNew(p, msg, args)
+@@ -6874,6 +6968,7 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
+ 		return
+ 	}
+ 
++	msg.weixinChatTicket.cancel()
+ 	slog.Info("cmdNew: cleaning up old session", "session_key", msg.SessionKey)
+ 	e.cleanupInteractiveState(interactiveKey)
+ 	slog.Info("cmdNew: cleanup done, creating new session", "session_key", msg.SessionKey)
+@@ -7046,6 +7141,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
+ 		return
+ 	}
+ 
++	msg.weixinChatTicket.cancel()
+ 	slog.Info("cmdSwitch: cleaning up old session", "session_key", msg.SessionKey)
+ 	e.cleanupInteractiveState(interactiveKey)
+ 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
+@@ -10098,6 +10194,7 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
+ 	// session-tracking write-back keeps AgentSessionID pointing at Claude's
+ 	// latest forked session, so resuming after /stop is safe and no longer
+ 	// triggers the recycling loop from issue #830.
++	cancelledWaiting := msg.weixinChatTicket.cancel()
+ 	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
+ 	if !e.stopInteractiveSession(iKey, p, msg.ReplyCtx) {
+ 		// Fallback: try suffix scan in case interactiveKeyForSessionKey
+@@ -10109,7 +10206,11 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
+ 				return
+ 			}
+ 		}
+-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
++		if cancelledWaiting {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
++		} else {
++			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
++		}
+ 		return
+ 	}
+ 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+@@ -10125,6 +10226,7 @@ func (e *Engine) cmdCancel(p Platform, msg *Message) {
+ 		return
+ 	}
+ 
++	msg.weixinChatTicket.cancel()
+ 	slog.Info("cmdCancel: stopping execution and creating new session", "session_key", msg.SessionKey)
+ 
+ 	// Stop the current execution (like /stop)
+diff --git a/core/material_intake.go b/core/material_intake.go
+index 1b42c0c..78a8d1c 100644
+--- a/core/material_intake.go
++++ b/core/material_intake.go
+@@ -25,7 +25,11 @@ func isMaterialInput(msg *Message) bool {
+ 		}
+ 	}
+ 	text := strings.ToLower(msg.Content)
+-	for _, word := range []string{"材料", "通知", "表格", "压缩包", "成绩", "绩点", "填表", "申请表", "发完了", "先填", "可以填", "收齐了", ".doc", ".xls", ".zip"} {
++	// A plain request to notify someone in Weixin can be part of a chat.
++	if !msg.WeixinPlainText && strings.Contains(text, "通知") {
++		return true
++	}
++	for _, word := range []string{"材料", "学校通知", "活动通知", "群通知", "通知原文", "通知内容", "表格", "压缩包", "成绩", "绩点", "填表", "申请表", "发完了", "先填", "可以填", "收齐了", ".doc", ".xls", ".zip"} {
+ 		if strings.Contains(text, word) {
+ 			return true
+ 		}
+@@ -89,8 +93,10 @@ func (e *Engine) queuedMaterial(p Platform, msg *Message, state *interactiveStat
+ 		userID: msg.UserID, userName: msg.UserName, msgPlatform: msg.Platform,
+ 		msgSessionKey: msg.SessionKey, channelKey: msg.ChannelKey,
+ 		userMessageTimeMs: msg.UserMessageTimeMs, material: material,
++		weixinChatTicket: msg.weixinChatTicket,
+ 	}
+ 	if !material {
++		queued.materialParts = msg.weixinChatParts
+ 		return queued
+ 	}
+ 	workDir := state.workspaceDir
+@@ -186,6 +192,9 @@ func removeMaterialPart(queued queuedMessage, messageID string) (queuedMessage,
+ 	if len(retained) == 0 {
+ 		return queued, true, true
+ 	}
++	if !queued.material {
++		return mergeWeixinChatParts(retained), true, false
++	}
+ 	rebuilt := retained[0]
+ 	for _, part := range retained[1:] {
+ 		rebuilt = mergeMaterialMessages(rebuilt, part)
+diff --git a/core/message.go b/core/message.go
+index 7e04b79..0bce97d 100644
+--- a/core/message.go
++++ b/core/message.go
+@@ -361,16 +361,21 @@ type LocationAttachment struct {
+ 
+ // Message represents a unified incoming message from any platform.
+ type Message struct {
+-	materialInput bool   // engine-only classification; never authenticated user text
+-	SessionKey    string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
+-	Platform      string
+-	MessageID     string // platform message ID for tracing
+-	Recalled      bool   // true for platform message recall/delete events targeting MessageID
+-	ChannelID     string
+-	UserID        string
+-	UserName      string
+-	ChatName      string // human-readable chat/group name (optional)
+-	Content       string
++	// WeixinPlainText is set only for one or more original plain text items,
++	// without quotes or media, by the Weixin adapter.
++	WeixinPlainText  bool
++	weixinChatTicket weixinChatTicket
++	weixinChatParts  []queuedMessage // original inputs for an admitted chat batch
++	materialInput    bool            // engine-only classification; never authenticated user text
++	SessionKey       string          // unique key for user context, e.g. "feishu:{chatID}:{userID}"
++	Platform         string
++	MessageID        string // platform message ID for tracing
++	Recalled         bool   // true for platform message recall/delete events targeting MessageID
++	ChannelID        string
++	UserID           string
++	UserName         string
++	ChatName         string // human-readable chat/group name (optional)
++	Content          string
+ 	// SourceUserContent is captured by the platform before custom-command expansion.
+ 	// Empty means no authenticated source text is available to memory.
+ 	SourceUserContent string
+diff --git a/core/weixin_chat_burst.go b/core/weixin_chat_burst.go
+new file mode 100644
+index 0000000..3e17032
+--- /dev/null
++++ b/core/weixin_chat_burst.go
+@@ -0,0 +1,212 @@
++package core
++
++import (
++	"errors"
++	"log/slog"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++	"unicode/utf8"
++)
++
++const (
++	weixinChatWindow      = 2400 * time.Millisecond
++	weixinChatMaxMessages = 6
++	weixinChatMaxRunes    = 96
++)
++
++type weixinDirectInbox interface {
++	OrderedDirectInboxPeer() string
++}
++
++type pendingWeixinChat struct {
++	timer    *time.Timer
++	deadline time.Time
++	messages []*Message
++	deliver  func(*Message)
++}
++
++type weixinChatLane struct {
++	mu         sync.Mutex
++	generation atomic.Uint64
++	pending    *pendingWeixinChat
++}
++
++var errWeixinChatCancelled = errors.New("Weixin chat turn superseded by a session command")
++
++type weixinChatTicket struct {
++	lane       *weixinChatLane
++	generation uint64
++}
++
++func (ticket weixinChatTicket) current() bool {
++	return ticket.lane == nil || ticket.lane.generation.Load() == ticket.generation
++}
++
++// The authorized command handler holds lane.mu when it invalidates inputs.
++func (ticket weixinChatTicket) cancel() bool {
++	lane := ticket.lane
++	if lane == nil {
++		return false
++	}
++	waiting := lane.pending != nil
++	lane.discard()
++	lane.generation.Add(1)
++	return waiting
++}
++
++// The legacy shared session keys are safe to batch only when each configured
++// Weixin account has a unique explicit peer, and this sender owns the DM.
++func (e *Engine) directWeixinChatLane(p Platform, msg *Message) *weixinChatLane {
++	inbox, ok := p.(weixinDirectInbox)
++	if !ok || e.multiWorkspace || p.Name() != "weixin" || msg.Platform != "weixin" ||
++		msg.UserID == "" || msg.SessionKey != "weixin:dm:"+msg.UserID ||
++		!strings.EqualFold(inbox.OrderedDirectInboxPeer(), msg.UserID) {
++		return nil
++	}
++	account, peer := PlatformAccountID(p), inbox.OrderedDirectInboxPeer()
++	var accounts, peers int
++	for _, platform := range e.platforms {
++		if platform.Name() != "weixin" {
++			continue
++		}
++		other, ok := platform.(weixinDirectInbox)
++		if !ok || other.OrderedDirectInboxPeer() == "" {
++			return nil
++		}
++		if PlatformAccountID(platform) == account {
++			accounts++
++		}
++		if strings.EqualFold(other.OrderedDirectInboxPeer(), peer) {
++			peers++
++		}
++	}
++	if account == "" || accounts != 1 || peers != 1 {
++		return nil
++	}
++	key := materialIdentity(p, msg.SessionKey, msg.UserID)
++	lane, _ := e.weixinChatLanes.LoadOrStore(key, &weixinChatLane{})
++	return lane.(*weixinChatLane)
++}
++
++func isWeixinChatBubble(msg *Message) bool {
++	text := strings.TrimSpace(msg.Content)
++	return msg.WeixinPlainText && !msg.materialInput && !msg.IsPermissionResponse &&
++		msg.ExtraContent == "" && msg.ModeOverride == "" && msg.OnAccepted == nil &&
++		msg.Audio == nil && !msg.FromVoice && msg.Location == nil &&
++		len(msg.Images) == 0 && len(msg.Files) == 0 &&
++		text != "" && text == strings.TrimSpace(msg.SourceUserContent) &&
++		!strings.HasPrefix(text, "/") && !strings.HasPrefix(text, "!") &&
++		utf8.RuneCountInString(text) <= weixinChatMaxRunes
++}
++
++// Called with the lane locked, after normal validation of each individual input.
++func (lane *weixinChatLane) add(e *Engine, p Platform, msg *Message, deliver func(*Message)) {
++	if lane.pending != nil && !time.Now().Before(lane.pending.deadline) {
++		lane.flush(e, p)
++	}
++	if lane.pending == nil {
++		batch := &pendingWeixinChat{deadline: time.Now().Add(weixinChatWindow)}
++		lane.pending = batch
++		batch.timer = time.AfterFunc(weixinChatWindow, func() {
++			lane.mu.Lock()
++			defer lane.mu.Unlock()
++			if lane.pending == batch {
++				lane.flush(e, p)
++			}
++		})
++	}
++	lane.pending.messages = append(lane.pending.messages, msg)
++	lane.pending.deliver = deliver
++	if len(lane.pending.messages) >= weixinChatMaxMessages {
++		lane.flush(e, p)
++	}
++}
++
++func (lane *weixinChatLane) discard() {
++	if lane != nil && lane.pending != nil {
++		lane.pending.timer.Stop()
++		lane.pending = nil
++	}
++}
++
++func (lane *weixinChatLane) retract(messageID string) {
++	if lane == nil || lane.pending == nil || messageID == "" {
++		return
++	}
++	messages := lane.pending.messages
++	for i, message := range messages {
++		if message.MessageID == messageID {
++			lane.pending.messages = append(messages[:i], messages[i+1:]...)
++			if len(lane.pending.messages) == 0 {
++				lane.discard()
++			}
++			return
++		}
++	}
++}
++
++func (lane *weixinChatLane) flush(e *Engine, p Platform) {
++	if lane == nil || lane.pending == nil {
++		return
++	}
++	pending := lane.pending
++	lane.discard()
++	if e.ctx.Err() != nil {
++		return
++	}
++	messages := pending.messages
++	if len(messages) == 1 {
++		pending.deliver(messages[0])
++		return
++	}
++	parts := make([]queuedMessage, 0, len(messages))
++	for _, msg := range messages {
++		parts = append(parts, e.queuedMaterial(p, msg, nil, false))
++	}
++	joined := mergeWeixinChatParts(parts)
++	latest := *messages[len(messages)-1]
++	latest.Content = joined.content
++	latest.UserMessageTimeMs = joined.userMessageTimeMs
++	latest.weixinChatParts = parts
++	slog.Info("weixin chat input batched", "messages", len(parts), "window_ms", weixinChatWindow.Milliseconds())
++	pending.deliver(&latest)
++}
++
++func mergeWeixinChatParts(parts []queuedMessage) queuedMessage {
++	joined := parts[len(parts)-1]
++	if len(parts) == 1 {
++		return joined
++	}
++	joined.materialParts = parts
++	var prompt strings.Builder
++	prompt.WriteString("【同一用户连续发来的消息，按到达顺序列出。先看完整组，再一起回应。】")
++	for _, part := range parts {
++		prompt.WriteString("\n\n【独立消息】\n")
++		prompt.WriteString(part.content)
++		if part.userMessageTimeMs > joined.userMessageTimeMs {
++			joined.userMessageTimeMs = part.userMessageTimeMs
++		}
++	}
++	joined.content = prompt.String()
++	return joined
++}
++
++func (input queuedMessage) addChatHistory(session *Session) bool {
++	if input.material || len(input.materialParts) == 0 {
++		session.AddHistory("user", input.content)
++		return false
++	}
++	for _, original := range input.materialParts {
++		session.AddHistory("user", original.content)
++	}
++	return true
++}
++
++func (input queuedMessage) languageContent() string {
++	if !input.material && len(input.materialParts) > 0 {
++		return input.sourceUserContent
++	}
++	return input.content
++}
+diff --git a/core/weixin_chat_burst_test.go b/core/weixin_chat_burst_test.go
+new file mode 100644
+index 0000000..954cbf7
+--- /dev/null
++++ b/core/weixin_chat_burst_test.go
+@@ -0,0 +1,260 @@
++package core
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++type weixinChatFixturePlatform struct {
++	*materialAccountPlatform
++	peer string
++}
++
++func (p *weixinChatFixturePlatform) OrderedDirectInboxPeer() string { return p.peer }
++
++func testWeixinAccount(account, peer string) *weixinChatFixturePlatform {
++	return &weixinChatFixturePlatform{&materialAccountPlatform{&stubPlatformEngine{n: "weixin"}, account}, peer}
++}
++
++func newWeixinChatTest(t *testing.T) (*Engine, Platform, *queuingAgentSession) {
++	t.Helper()
++	p := testWeixinAccount("test-account", "test-peer")
++	s := newQueuingSession("weixin-chat-replay")
++	store := t.TempDir()
++	e := NewEngine("test", &controllableAgent{nextSession: s}, []Platform{p}, filepath.Join(store, "sessions.json"), LangEnglish)
++	e.baseWorkDir = store
++	t.Cleanup(func() { _ = e.Stop() })
++	return e, p, s
++}
++
++func weixinChatInput(id, content string) *Message {
++	return &Message{
++		SessionKey:        "weixin:dm:test-peer",
++		Platform:          "weixin",
++		UserID:            "test-peer",
++		MessageID:         id,
++		Content:           content,
++		SourceUserContent: content,
++		WeixinPlainText:   true,
++	}
++}
++
++func chatReplayPrompts(s *queuingAgentSession) []string {
++	s.sendMu.Lock()
++	defer s.sendMu.Unlock()
++	return append([]string(nil), s.sendCalls...)
++}
++
++func waitForChatReplayPrompt(t *testing.T, s *queuingAgentSession) string {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if ps := chatReplayPrompts(s); len(ps) > 0 {
++			return ps[0]
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("agent did not receive the chat input")
++	return ""
++}
++
++func TestWeixinShortChatWaitsForSecondBubbleAndKeepsOrder(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	first := weixinChatInput("first", "帮我转告对方")
++	second := weixinChatInput("second", "今晚六点见")
++	e.handleMessage(p, first)
++	// Replay the observed gap between the incomplete request and its detail.
++	time.Sleep(2020 * time.Millisecond)
++	if ps := chatReplayPrompts(s); len(ps) != 0 {
++		t.Fatal("agent started on the first fragment before the second arrived")
++	}
++	e.handleMessage(p, second)
++	prompt := waitForChatReplayPrompt(t, s)
++	a, b := strings.Index(prompt, first.Content), strings.Index(prompt, second.Content)
++	if a < 0 || b <= a {
++		t.Fatalf("expected both original bubbles in order, got %q", prompt)
++	}
++	if count := len(chatReplayPrompts(s)); count != 1 {
++		t.Fatalf("received %d model turns, want 1", count)
++	}
++	history := e.sessions.GetOrCreateActive(first.SessionKey).GetHistory(10)
++	if len(history) != 2 || history[0].Content != first.Content || history[1].Content != second.Content {
++		t.Fatalf("original bubbles were not kept individually: %+v", history)
++	}
++}
++
++func TestWeixinBusyQueueCombinesOnlyAdjacentShortChat(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	e.handleMessage(p, weixinChatInput("running", strings.Repeat("p", 97)))
++	waitForChatReplayPrompt(t, s)
++	e.handleMessage(p, weixinChatInput("first", "把两条合起来"))
++	e.handleMessage(p, weixinChatInput("second", "这句是补充"))
++	s.events <- Event{Type: EventResult, Content: "done", Done: true}
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		ps := chatReplayPrompts(s)
++		if len(ps) == 2 {
++			if !strings.Contains(ps[1], "把两条合起来") || !strings.Contains(ps[1], "这句是补充") {
++				t.Fatalf("busy queue split the follow-up: %q", ps[1])
++			}
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("queued follow-up was not processed after the first turn")
++}
++
++func TestWeixinChatControlCancelsInputStillInWindow(t *testing.T) {
++	for _, command := range []string{"stop", "new"} {
++		t.Run(command, func(t *testing.T) {
++			t.Parallel()
++			e, p, s := newWeixinChatTest(t)
++			e.handleMessage(p, weixinChatInput("pending", "等会再回答"))
++			e.handleMessage(p, weixinChatInput("control", "/"+command))
++			time.Sleep(weixinChatWindow + 100*time.Millisecond)
++			if len(chatReplayPrompts(s)) != 0 {
++				t.Fatal("the cancelled input reached the agent")
++			}
++		})
++	}
++}
++
++func TestWeixinChatStopPreventsLateAgentStartup(t *testing.T) {
++	e, p, _ := newWeixinChatTest(t)
++	msg := weixinChatInput("old", "这一条需要停下")
++	lane := e.directWeixinChatLane(p, msg)
++	if lane == nil {
++		t.Fatal("fixture did not receive a direct inbox")
++	}
++	msg.weixinChatTicket = weixinChatTicket{lane: lane, generation: lane.generation.Load()}
++	e.agent.(*controllableAgent).startSessionFn = func(context.Context, string) (AgentSession, error) {
++		t.Error("a stopped turn started an agent")
++		return nil, errors.New("fixture agent must not start")
++	}
++
++	session := e.sessions.GetOrCreateActive(msg.SessionKey)
++	if !session.TryLock() {
++		t.Fatal("fixture could not lock the active session")
++	}
++	e.ensureInteractiveStateForQueueing(msg.SessionKey, p, msg.ReplyCtx)
++	e.handleMessage(p, weixinChatInput("control", "/stop"))
++	// The previous dispatch has been admitted but its worker has not started.
++	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, msg.SessionKey, "", "")
++	if history := session.GetHistory(0); len(history) != 0 {
++		t.Fatal("a stopped turn wrote a late history entry")
++	}
++}
++
++func TestWeixinChatDoesNotShareAmbiguousAccountsOrPeers(t *testing.T) {
++	for _, other := range []*weixinChatFixturePlatform{
++		testWeixinAccount("second-account", "test-peer"),
++		testWeixinAccount("test-account", "second-peer"),
++	} {
++		p := testWeixinAccount("test-account", "test-peer")
++		e := NewEngine("test", &controllableAgent{}, []Platform{p, other}, "", LangEnglish)
++		if e.directWeixinChatLane(p, weixinChatInput("m1", "这条不能混在一起")) != nil {
++			t.Error("batching was enabled for ambiguous account or peer ownership")
++		}
++		_ = e.Stop()
++	}
++}
++
++func TestWeixinSixBubblesConsumeOneBusyQueueSlotAndSaveOriginals(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	e.SetMaxQueuedMessages(1)
++	e.handleMessage(p, weixinChatInput("running", strings.Repeat("p", 97)))
++	waitForChatReplayPrompt(t, s)
++	texts := []string{"一条", "二条", "三条", "四条", "五条", "六条"}
++	for _, text := range texts {
++		e.handleMessage(p, weixinChatInput(text, text))
++	}
++	s.events <- Event{Type: EventResult, Content: "done", Done: true}
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		ps := chatReplayPrompts(s)
++		if len(ps) == 2 {
++			saved, err := os.ReadFile(filepath.Join(e.baseWorkDir, "sessions.json"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			var snapshot sessionSnapshot
++			if err := json.Unmarshal(saved, &snapshot); err != nil {
++				t.Fatal(err)
++			}
++			key := weixinChatInput("", "").SessionKey
++			active := snapshot.Sessions[snapshot.ActiveSession[key]]
++			if active == nil || len(active.History) < len(texts) {
++				t.Fatal("saved active session is missing its original bubbles")
++			}
++			history := active.History[len(active.History)-len(texts):]
++			offset := -1
++			for i, text := range texts {
++				at := strings.Index(ps[1], text)
++				if at <= offset || history[i].Role != "user" || history[i].Content != text {
++					t.Fatalf("missing or unordered input %q in batch or saved history", text)
++				}
++				offset = at
++			}
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("full input batch was not sent as one follow-up")
++}
++
++func TestWeixinChatSurvivesIdleAgentEvictionBeforeDispatch(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	msg := weixinChatInput("incoming", "接得上吗")
++	old := newControllableSession("old-idle")
++	state := &interactiveState{agentSession: old, platform: p, agentSessionIdleToken: 42}
++	e.interactiveStates[msg.SessionKey] = state
++	e.handleMessage(p, msg)
++	e.cleanupInteractiveStateForIdleToken(msg.SessionKey, state, 42, time.Minute)
++	if got := waitForChatReplayPrompt(t, s); !strings.Contains(got, msg.Content) {
++		t.Fatalf("input did not survive idle eviction: %q", got)
++	}
++}
++
++func TestWeixinMediaBoundaryFlushesPendingTextWithoutCombining(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	e.handleMessage(p, weixinChatInput("first", "还有一个附件"))
++	media := weixinChatInput("file", "看这个文档")
++	media.WeixinPlainText = false
++	media.Files = []FileAttachment{{FileName: "fixture.docx", MimeType: "application/octet-stream", Data: []byte("fixture bytes")}}
++	e.handleMessage(p, media)
++	first := waitForChatReplayPrompt(t, s)
++	if !strings.Contains(first, "还有一个附件") || strings.Contains(first, "看这个文档") {
++		t.Fatalf("media was not kept separate: %q", first)
++	}
++}
++
++func TestWeixinBurstKeepsSecondBubbleWhenPreviousTurnCompletesMidWindow(t *testing.T) {
++	e, p, s := newWeixinChatTest(t)
++	e.handleMessage(p, weixinChatInput("running", strings.Repeat("p", 97)))
++	waitForChatReplayPrompt(t, s)
++	e.handleMessage(p, weixinChatInput("first", "接下来通知对方一下"))
++	s.events <- Event{Type: EventResult, Content: "done", Done: true}
++	time.Sleep(300 * time.Millisecond)
++	if ps := chatReplayPrompts(s); len(ps) != 1 {
++		t.Fatalf("previous turn ended and started on an incomplete bubble: %q", ps)
++	}
++	e.handleMessage(p, weixinChatInput("second", "请对方稍等"))
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		ps := chatReplayPrompts(s)
++		if len(ps) == 2 {
++			if !strings.Contains(ps[1], "接下来通知对方一下") || !strings.Contains(ps[1], "请对方稍等") {
++				t.Fatalf("the follow-up was split: %q", ps[1])
++			}
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("the combined follow-up did not reach the agent")
++}
+diff --git a/core/weixin_chat_controls_test.go b/core/weixin_chat_controls_test.go
+new file mode 100644
+index 0000000..3b06f9c
+--- /dev/null
++++ b/core/weixin_chat_controls_test.go
+@@ -0,0 +1,144 @@
++package core
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestWeixinChatControlsStopPrefixCancelsBufferedInput(t *testing.T) {
++	t.Parallel()
++	e, platform, agentSession := newWeixinChatTest(t)
++	p := platform.(*weixinChatFixturePlatform)
++	e.ReceiveMessage(p, weixinChatInput("active", strings.Repeat("p", 97)))
++	waitForChatReplayPrompt(t, agentSession)
++
++	e.ReceiveMessage(p, weixinChatInput("first", "first pending bubble"))
++	e.ReceiveMessage(p, weixinChatInput("second", "second pending bubble"))
++	e.ReceiveMessage(p, weixinChatInput("stop", "/sto"))
++	// A flush into the busy queue before stopping exposes queue or reset replies.
++	if got := p.getSent(); len(got) != 1 || got[0] != e.i18n.T(MsgExecutionStopped) {
++		t.Fatalf("replies = %q, want only the stop confirmation", got)
++	}
++
++	deadline := time.NewTimer(weixinChatWindow + 100*time.Millisecond)
++	defer deadline.Stop()
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++	for {
++		if got := chatReplayPrompts(agentSession); len(got) != 1 {
++			t.Fatalf("stopped batch reached the agent: %q", got)
++		}
++		select {
++		case <-tick.C:
++		case <-deadline.C:
++			return
++		}
++	}
++}
++
++func TestWeixinChatControlsInvalidSwitchPreservesBufferedInput(t *testing.T) {
++	t.Parallel()
++	e, platform, agentSession := newWeixinChatTest(t)
++	p := platform.(*weixinChatFixturePlatform)
++	first := weixinChatInput("first", "first preserved bubble")
++	second := weixinChatInput("second", "second preserved bubble")
++	const missing = "missing-fixture-session"
++
++	e.ReceiveMessage(p, first)
++	e.ReceiveMessage(p, second)
++	e.ReceiveMessage(p, weixinChatInput("switch", "/switch "+missing))
++	if got := p.getSent(); len(got) != 1 || got[0] != fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), missing) {
++		t.Fatalf("replies = %q, want the missing-session error", got)
++	}
++	prompt := waitForChatReplayPrompt(t, agentSession)
++	firstAt := strings.Index(prompt, first.Content)
++	secondAt := strings.Index(prompt, second.Content)
++	if firstAt < 0 || secondAt <= firstAt {
++		t.Fatalf("agent prompt lost or reordered the buffered input: %q", prompt)
++	}
++}
++
++type weixinChatControlsTypingPlatform struct {
++	*weixinChatFixturePlatform
++	typingCalls atomic.Int32
++	secondStart chan struct{}
++	resume      chan struct{}
++}
++
++func (p *weixinChatControlsTypingPlatform) StartTyping(ctx context.Context, _ any) func() {
++	if p.typingCalls.Add(1) == 2 {
++		close(p.secondStart)
++		select {
++		case <-p.resume:
++		case <-ctx.Done():
++		}
++	}
++	return func() {}
++}
++
++func TestWeixinChatControlsBusySwitchPreventsOldSend(t *testing.T) {
++	t.Parallel()
++	const targetID = "fixture-switch-target"
++	const targetSummary = "Fixture destination session"
++	old := newQueuingSession("fixture-switch-old")
++	target := newQueuingSession(targetID)
++	p := &weixinChatControlsTypingPlatform{
++		weixinChatFixturePlatform: testWeixinAccount("test-account", "test-peer"),
++		secondStart:               make(chan struct{}),
++		resume:                    make(chan struct{}),
++	}
++	resume := sync.OnceFunc(func() { close(p.resume) })
++	defer resume()
++	agent := &controllableAgent{
++		listFn: func() ([]AgentSessionInfo, error) {
++			return []AgentSessionInfo{{ID: targetID, Summary: targetSummary, MessageCount: 1}}, nil
++		},
++		startSessionFn: func(_ context.Context, id string) (AgentSession, error) {
++			if id == targetID {
++				return target, nil
++			}
++			return old, nil
++		},
++	}
++	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
++	e.baseWorkDir = t.TempDir()
++	t.Cleanup(func() { _ = e.Stop() })
++
++	first := weixinChatInput("active", strings.Repeat("p", 97))
++	e.ReceiveMessage(p, first)
++	waitForChatReplayPrompt(t, old)
++	oldSession := e.sessions.GetOrCreateActive(first.SessionKey)
++	for i := 1; i <= weixinChatMaxMessages; i++ {
++		e.ReceiveMessage(p, weixinChatInput(fmt.Sprint(i), fmt.Sprintf("queued bubble %d", i)))
++	}
++	old.events <- Event{Type: EventResult, Content: "first turn finished", Done: true}
++	select {
++	case <-p.secondStart:
++	case <-time.After(3 * time.Second):
++		t.Fatal("queued batch did not reach its StartTyping barrier")
++	}
++
++	e.ReceiveMessage(p, weixinChatInput("switch", "/switch "+targetID))
++	if !strings.Contains(strings.Join(p.getSent(), "\n"), targetSummary) {
++		t.Fatalf("switch did not confirm the target: %q", p.getSent())
++	}
++	resume()
++	if !e.waitForSessionLock(oldSession, 2*time.Second) {
++		t.Fatal("old turn did not exit after switching sessions")
++	}
++	oldSession.Unlock()
++
++	probe := weixinChatInput("new", strings.Repeat("q", 97))
++	e.ReceiveMessage(p, probe)
++	if got := waitForChatReplayPrompt(t, target); !strings.Contains(got, probe.Content) || strings.Contains(got, "queued bubble") {
++		t.Errorf("unexpected prompt in the switched session: %q", got)
++	}
++	if got := chatReplayPrompts(old); len(got) != 1 {
++		t.Errorf("queued batch reached the old agent after switch: %q", got)
++	}
++}
+diff --git a/platform/weixin/ordered_inbox_test.go b/platform/weixin/ordered_inbox_test.go
+new file mode 100644
+index 0000000..4dd787f
+--- /dev/null
++++ b/platform/weixin/ordered_inbox_test.go
+@@ -0,0 +1,73 @@
++package weixin
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/chenhg5/cc-connect/core"
++)
++
++func TestOrderedDirectInboxPreservesPollMessageOrder(t *testing.T) {
++	p := &Platform{accountLabel: "fixture-account", allowFrom: "test-peer"}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	update := func(id int64, text string) weixinMessage {
++		return weixinMessage{FromUserID: "test-peer", MessageType: messageTypeUser, MessageID: id,
++			ItemList: []messageItem{{Type: messageItemText, TextItem: &textItem{Text: text}}}}
++	}
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	seen := make(chan *core.Message, 3)
++	go p.dispatchUpdates(ctx, []weixinMessage{update(1, "一"), update(2, "二"), update(3, "/stop")},
++		func(_ core.Platform, msg *core.Message) {
++			if msg.MessageID == "1" {
++				close(entered)
++				select {
++				case <-ctx.Done():
++					return
++				case <-release:
++				}
++			}
++			seen <- msg
++		})
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("first update did not enter the handler")
++	}
++	select {
++	case msg := <-seen:
++		t.Fatalf("update %s overtook the first packet", msg.MessageID)
++	case <-time.After(40 * time.Millisecond):
++	}
++	close(release)
++	for _, want := range []string{"一", "二", "/stop"} {
++		select {
++		case msg := <-seen:
++			if msg.Content != want || !msg.WeixinPlainText {
++				t.Fatalf("got %+v, want original text %q", msg, want)
++			}
++		case <-time.After(time.Second):
++			t.Fatalf("missing input %q", want)
++		}
++	}
++}
++
++func TestPlainItemClassificationUsesTheOriginalPacket(t *testing.T) {
++	text := messageItem{Type: messageItemText, TextItem: &textItem{Text: "caption or transcription"}}
++	quote := text
++	quote.RefMsg = &refMessage{}
++	for _, items := range [][]messageItem{
++		{text, {Type: messageItemImage}},
++		{text, {Type: messageItemVoice}},
++		{quote},
++	} {
++		if plainTextItems(items) {
++			t.Fatal("non-text content passed the batching gate")
++		}
++	}
++	if !plainTextItems([]messageItem{text}) {
++		t.Fatal("plain text was rejected")
++	}
++}
+diff --git a/platform/weixin/weixin.go b/platform/weixin/weixin.go
+index 6186844..b010c86 100644
+--- a/platform/weixin/weixin.go
++++ b/platform/weixin/weixin.go
+@@ -244,6 +244,16 @@ func pickInt(v any) int {
+ 
+ func (p *Platform) Name() string              { return "weixin" }
+ func (p *Platform) PlatformAccountID() string { return p.accountLabel }
++
++// OrderedDirectInboxPeer opts in only a named account with one explicit peer.
++func (p *Platform) OrderedDirectInboxPeer() string {
++	peer := strings.TrimSpace(p.allowFrom)
++	if p.accountLabel == "" || strings.ContainsAny(peer, "*,") {
++		return ""
++	}
++	return peer
++}
++
+ func (p *Platform) OwnsTimerRecipient(key string) bool {
+ 	const prefix = "weixin:dm:"
+ 	if !strings.HasPrefix(key, prefix) {
+@@ -460,16 +470,7 @@ func (p *Platform) pollLoop(ctx context.Context) {
+ 		if h == nil {
+ 			continue
+ 		}
+-		var wg sync.WaitGroup
+-		for i := range resp.Msgs {
+-			i := i
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				p.dispatchInbound(ctx, &resp.Msgs[i], h)
+-			}()
+-		}
+-		wg.Wait()
++		p.dispatchUpdates(ctx, resp.Msgs, h)
+ 
+ 		if ctx.Err() == nil && resp.GetUpdatesBuf != "" {
+ 			p.syncBufMu.Lock()
+@@ -479,6 +480,40 @@ func (p *Platform) pollLoop(ctx context.Context) {
+ 	}
+ }
+ 
++func (p *Platform) dispatchUpdates(ctx context.Context, messages []weixinMessage, h core.MessageHandler) {
++	if p.OrderedDirectInboxPeer() != "" {
++		for i := range messages {
++			if ctx.Err() != nil {
++				return
++			}
++			p.dispatchInbound(ctx, &messages[i], h)
++		}
++		return
++	}
++	var wg sync.WaitGroup
++	for i := range messages {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			p.dispatchInbound(ctx, &messages[i], h)
++		}(i)
++	}
++	wg.Wait()
++}
++
++func plainTextItems(items []messageItem) bool {
++	if len(items) == 0 {
++		return false
++	}
++	for _, item := range items {
++		if item.Type != messageItemText || item.TextItem == nil || item.RefMsg != nil ||
++			item.VoiceItem != nil || item.ImageItem != nil || item.FileItem != nil || item.VideoItem != nil {
++			return false
++		}
++	}
++	return true
++}
++
+ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core.MessageHandler) {
+ 	if m == nil {
+ 		return
+@@ -556,6 +591,7 @@ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core
+ 		UserName:          shortWeixinUser(from),
+ 		Content:           body,
+ 		SourceUserContent: sourceUserContent,
++		WeixinPlainText:   p.OrderedDirectInboxPeer() != "" && plainTextItems(m.ItemList),
+ 		Images:            images,
+ 		Files:             files,
+ 		Audio:             audio,
