@@ -280,7 +280,8 @@ class SyncTests(unittest.TestCase):
 
 class HealthTests(unittest.TestCase):
     def run_health(self, stale=False, tasks='cc-connect-watchdog=Ready\ncc-connect-backup=Ready',
-                   jobs=None, timer_output='Pending timers (0)', timer_code=0):
+                   jobs=None, timer_output='Pending timers (0)', timer_code=0,
+                   log_lines=(), output=None):
         with temp_directory() as temp:
             root = Path(temp)
             memory = root / 'memory'; memory.mkdir()
@@ -289,6 +290,9 @@ class HealthTests(unittest.TestCase):
             (root / 'crons').mkdir()
             (root / 'crons/jobs.json').write_text(json.dumps([{'id':'capture01','enabled':True}] if jobs is None else jobs))
             (root / 'config.toml').write_text('fixture=true')
+            if log_lines:
+                (root / 'logs').mkdir()
+                (root / 'logs/cc-connect-1.log').write_text("\n".join(log_lines), encoding="utf-8")
             session = root / 'session.json'; session.write_text('{"sessions":{"s1":{}}}')
             backups = root / 'backups'; backups.mkdir()
             archive = backups / 'cc-weixin-daily-20260101.zip'; archive.write_bytes(b'fixture')
@@ -299,7 +303,7 @@ class HealthTests(unittest.TestCase):
             with patch.dict(sys.modules, {'capture_runtime':cap}):
                 health = load_module('operations_healthcheck', ROOT / 'tools/healthcheck.py', fake)
             health.ps = lambda command: tasks if 'Get-ScheduledTask' in command else '1'
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(output if output is not None else io.StringIO()):
                 return health.main()
 
     def test_missing_tasks_fail_healthcheck(self):
@@ -316,6 +320,20 @@ class HealthTests(unittest.TestCase):
 
     def test_timer_cli_failure_fails_healthcheck(self):
         self.assertEqual(self.run_health(timer_output='query failed', timer_code=1), 1)
+
+    def test_health_surfaces_model_fallback_and_weixin_chat_batches(self):
+        output = io.StringIO()
+        log = (
+            'level=WARN msg="codexSession: item error" message="Model metadata for `gpt-fixture` not found. Defaulting to fallback metadata; private data"',
+            'level=INFO msg="weixin chat input batched" messages=3 window_ms=2400',
+            'level=INFO msg="weixin chat input batched" messages=2 window_ms=2400',
+            'level=INFO msg="cron: job completed"',
+        )
+        self.assertEqual(self.run_health(log_lines=log, output=output), 0)
+        text = output.getvalue()
+        self.assertIn("gpt-fixture", text)
+        self.assertIn("2 组 / 5 条", text)
+        self.assertNotIn("private data", text)
 
 
 if __name__ == '__main__':
