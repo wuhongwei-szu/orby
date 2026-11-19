@@ -7,6 +7,8 @@ enforces the configured cooldown and daily cap without another probability gate.
 
 Usage:
     python -X utf8 send_sticker.py master --category happy [--style cat]
+    python -X utf8 send_sticker.py master|xi --relay --id <id>
+    python -X utf8 send_sticker.py master|xi --relay --category happy [--prefer <keywords>]
     python -X utf8 send_sticker.py xi --category affection --proactive
     python -X utf8 send_sticker.py master --list
 """
@@ -15,18 +17,11 @@ import datetime
 import os
 import random
 import re
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as c
-
-try:
-    import send_xi
-    from send_xi import ILinkError
-except Exception:  # pragma: no cover - cryptography should exist on this machine
-    send_xi = None
-    ILinkError = Exception
+import send_msg
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -136,7 +131,19 @@ def choose(manifest, category=None, style=None, sticker_id=None):
     return random.choice(pool)
 
 
-def _select_candidate(manifest, category, style, sticker_id, state, target, prefer=None):
+def _matching_stickers(pool, prefer):
+    keywords = [word.lower() for word in re.split(r"[,，\s]+", prefer.strip()) if word]
+    tags = load_extra_tags()
+    matches = []
+    for entry in pool:
+        labels = [entry.get("label", ""), *entry.get("tags", []), *tags.get(entry["id"], [])]
+        if any(word in " ".join(labels).lower() for word in keywords):
+            matches.append(entry)
+    return matches
+
+
+def _select_candidate(manifest, category, style, sticker_id, state, target, prefer=None,
+                      *, require_preference=False):
     base = choose(manifest, category, style, sticker_id)
     if sticker_id:
         return base
@@ -145,6 +152,10 @@ def _select_candidate(manifest, category, style, sticker_id, state, target, pref
     if isinstance(feedback, dict):
         banned = {sid for sid, fb in feedback.items() if isinstance(fb, dict) and fb.get("banned")}
         pool = [entry for entry in pool if entry["id"] not in banned]
+        if not pool:
+            return None
+    if require_preference and prefer:
+        pool = _matching_stickers(pool, prefer)
         if not pool:
             return None
     clear = [e for e in pool if min(int(e.get("width", 0)), int(e.get("height", 0))) >= MIN_DIM]
@@ -165,15 +176,8 @@ def _select_candidate(manifest, category, style, sticker_id, state, target, pref
         oldest = min(last_used[e["id"]] for e in pool)
         pool = [e for e in pool if last_used[e["id"]] == oldest]
 
-    if prefer:
-        keywords = [k.strip().lower() for k in re.split(r"[,，\s]+", prefer) if k.strip()]
-        matched = []
-        extra = load_extra_tags()
-        for entry in pool:
-            tags = list(entry.get("tags", [])) + extra.get(entry.get("id", ""), [])
-            haystack = (entry.get("label", "") + " " + " ".join(tags)).lower()
-            if any(keyword in haystack for keyword in keywords):
-                matched.append(entry)
+    if prefer and not require_preference:
+        matched = _matching_stickers(pool, prefer)
         if matched:
             pool = matched
         else:
@@ -189,48 +193,9 @@ def _select_candidate(manifest, category, style, sticker_id, state, target, pref
 
 
 def _send_master(path):
-    if not c.MASTER_SESSION:
-        raise SystemExit("缺少 master session")
-    result = c.run_cc([
-        "send", "-p", c.PROJECT, "--session", c.MASTER_SESSION, "--image", path,
-    ], timeout=60)
-    output = (result.stdout or "").strip()
-    error = (result.stderr or "").strip()
-    if result.returncode != 0:
-        detail = error or output or "cc-connect send --image failed"
-        print(f"表情发送失败：{detail[:300]}")
-        return 1
-    print(output or "已发送")
-    return 0
-
-
-def _send_xi(path):
-    if send_xi is None:
-        print("表情发送失败：缺少 send_xi 模块")
-        return 1
-    # Choose one transport. A failed/unknown cc-connect result may still mean
-    # delivery, so do not fall through to a second send through direct iLink.
-    if c.current_target() == "xi" and c.XI_SESSION:
-        try:
-            first = c.run_cc([
-                "send", "-p", c.PROJECT, "--session", c.XI_SESSION,
-                "--image", path,
-            ], timeout=60)
-        except (subprocess.TimeoutExpired, OSError):
-            print("表情发送结果未确认（cc-connect 调用异常）；不会切换通道补发，请先核实送达。")
-            return 1
-        if first.returncode == 0:
-            print((first.stdout or "").strip() or "已发送")
-            return 0
-        print("表情发送结果未确认（cc-connect 返回非零状态）；不会切换通道补发，请先核实送达。")
-        return 1
-    try:
-        send_xi.send_image(path)
-    except ILinkError as exc:
-        print(f"表情发送失败[{exc.stage}]：{exc.message}")
-        return exc.exit_code()
-    print("已发送")
-    return 0
+    """Keep existing same-conversation image callers on the guarded route."""
+    c.assert_target("master")
+    return send_msg._send_image_once("master", path)
 
 
 def _record(target, manifest, entry, proactive):
@@ -253,12 +218,18 @@ def _record(target, manifest, entry, proactive):
 
 @c.outbound_serialized
 def send_one(target, category=None, style=None, sticker_id=None,
-             proactive=False, force=False, dry_run=False, skip_budget=False, prefer=None):
-    """Select, send and record one sticker. Returns 0/-1/3; never raises on send."""
+             proactive=False, force=False, dry_run=False, skip_budget=False, prefer=None, *, relay=False):
+    """Select, send and record one sticker with the existing quota and cooldown."""
     if target not in {"master", "xi"}:
         print("需要目标 master 或 xi")
         return 1
-    c.assert_target(target)
+    if relay and proactive:
+        print("--relay 与 --proactive 互斥，图片未提交。")
+        return 2
+    if relay:
+        send_msg.assert_image_target(target, relay=True)
+    else:
+        c.assert_target(target)
     if proactive and not skip_budget:
         remaining, reason = c.proactive_remaining(target)
         if remaining <= 0:
@@ -269,10 +240,10 @@ def send_one(target, category=None, style=None, sticker_id=None,
     state = target_state(usage, target)
     sent = state.get("sent", [])
     if c.STICKER_DAILY_LIMIT > 0 and _count_today(sent) >= c.STICKER_DAILY_LIMIT:
-        print(f"今天表情额度用完了（{c.STICKER_DAILY_LIMIT}/{c.STICKER_DAILY_LIMIT}），这次只发文字")
+        print(f"今天表情额度用完了（{c.STICKER_DAILY_LIMIT}/{c.STICKER_DAILY_LIMIT}），本次表情未发送")
         return 3
     if proactive and c.STICKER_PROACTIVE_DAILY_LIMIT > 0 and _count_today(sent, proactive=True) >= c.STICKER_PROACTIVE_DAILY_LIMIT:
-        print("今天主动消息的表情额度已用完，这次只发文字")
+        print("今天主动消息的表情额度已用完，本次表情未发送")
         return 3
     last = _last_sent(sent)
     if COOLDOWN_SECONDS > 0 and last and not force:
@@ -281,9 +252,10 @@ def send_one(target, category=None, style=None, sticker_id=None,
             print(f"刚发过表情（{int(elapsed)} 秒前），这次先不发")
             return 3
 
-    entry = _select_candidate(manifest, category, style, sticker_id, state, target, prefer)
+    entry = _select_candidate(manifest, category, style, sticker_id, state, target, prefer,
+                              require_preference=relay)
     if entry is None:
-        print("这个分类没有可用表情（可能都被标记为不喜欢）")
+        print("没有符合要求的表情，本次未发送图片")
         return 3
     path = os.path.join(c.STICKER_DIR, entry["file"])
     if not os.path.isfile(path):
@@ -293,10 +265,13 @@ def send_one(target, category=None, style=None, sticker_id=None,
     if dry_run:
         return 0
 
-    code = _send_master(path) if target == "master" else _send_xi(path)
+    code = send_msg._send_image_once(target, path, relay=relay)
     if code == 0:
-        _record(target, manifest, entry, proactive)
-        c.record_outbound(target, proactive=proactive)
+        try:
+            _record(target, manifest, entry, proactive)
+            c.record_outbound(target, proactive=proactive)
+        except (OSError, c.local_state.StateError):
+            print("[state] 图片发送接口已接受，本地记录写入失败；请勿自动重发。", file=sys.stderr)
     return code
 
 
@@ -307,11 +282,15 @@ def main():
     parser.add_argument("--style", choices=["cat", "pig", "anime", "seio", "learned", "generic", "text", "silly"])
     parser.add_argument("--id", dest="sticker_id")
     parser.add_argument("--prefer", help="按标签/文字偏好筛选，如 贴贴,抱,合十,击掌")
-    parser.add_argument("--proactive", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--proactive", action="store_true")
+    mode.add_argument("--relay", action="store_true", help="仅在当前消息明确授权时跨会话转发表情")
     parser.add_argument("--force", action="store_true", help="跳过 2 分钟冷却（不跳过每日上限）")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
+    if args.relay and "--relay" not in sys.argv[1:]:
+        parser.error("跨会话表情需要显式 --relay")
 
     if args.list:
         manifest = load_manifest()
@@ -333,6 +312,7 @@ def main():
         force=args.force,
         dry_run=args.dry_run,
         prefer=args.prefer,
+        relay=args.relay,
     )
 
 
