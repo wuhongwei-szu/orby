@@ -207,12 +207,20 @@ def main():
         print("消息为空")
         return 1
     c.assert_target(target, relay=relay)
-    if target == "master":
-        return send_master(text)
-    if target == "xi":
-        return send_xi(text, relay=relay)
-    print("目标必须是 master 或 xi")
-    return 1
+    chunks = c.split_wechat_text(text)
+    if len(chunks) > 1:
+        print(f"[send] 消息超过 {c.WECHAT_TEXT_LIMIT} 字，已拆成 {len(chunks)} 条发送")
+    for chunk in chunks:
+        if target == "master":
+            code = send_master(chunk)
+        elif target == "xi":
+            code = send_xi(chunk, relay=relay)
+        else:
+            print("目标必须是 master 或 xi")
+            return 1
+        if code != 0:
+            return code
+    return 0
 
 
 if __name__ == "__main__":

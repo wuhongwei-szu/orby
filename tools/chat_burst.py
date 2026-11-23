@@ -28,6 +28,24 @@ if hasattr(sys.stdout, "reconfigure"):
 MAX_TOTAL_SLEEP = 5.0
 MAX_BURST_MESSAGES = 6
 MAX_PROACTIVE_BURST_MESSAGES = 2
+# A bubble that ends on a connective is almost certainly half a sentence.
+FRAGMENT_ENDINGS = (
+    "把", "被", "给", "和", "跟", "与", "向", "从", "对", "在", "是", "为",
+    "的", "了", "着", "过", "得", "地", "然后", "就是", "因为", "所以",
+    "但是", "而且", "，", ",", "、",
+)
+
+
+def _merge_fragments(messages):
+    """Join an obvious half-sentence with the following bubble."""
+    merged = []
+    for message in messages:
+        if merged and len(merged[-1]) <= 4 and merged[-1].endswith(FRAGMENT_ENDINGS):
+            merged[-1] += message
+            print(f"[chat] 合并半句: {merged[-1][:40]}")
+        else:
+            merged.append(message)
+    return merged
 
 
 def _delays(count, min_delay, max_delay, first_delay):
@@ -76,6 +94,13 @@ def main():
     if not messages:
         print("消息为空")
         return 1
+    messages = _merge_fragments(messages)
+    split_messages = []
+    for message in messages:
+        split_messages.extend(c.split_wechat_text(message))
+    if len(split_messages) != len(messages):
+        print(f"[chat] 长消息已拆成 {len(split_messages)} 条")
+    messages = split_messages
     probability = min(1.0, max(0.0, args.probability))
 
     send_sticker_flag = bool(args.sticker) and random.random() < probability

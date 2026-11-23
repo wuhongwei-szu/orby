@@ -417,6 +417,38 @@ def sanitize_wechat(text):
     return text
 
 
+WECHAT_TEXT_LIMIT = 300
+
+
+def split_wechat_text(text, limit=WECHAT_TEXT_LIMIT):
+    """Split long text into WeChat-sized chunks, preferring sentence boundaries.
+
+    iLink rejects long single messages with ret=-2 prepare failed.  Keep every
+    bubble at or below the same 300-character rule the AGENTS file states.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = max(window.rfind(ch) for ch in "。！？!?；;\n")
+        if cut < limit // 2:
+            cut = max(window.rfind(ch) for ch in "，,、 ")
+        if cut < limit // 3:
+            cut = limit - 1
+        chunk = remaining[:cut + 1].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut + 1:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def append_raw(sid, text, role="assistant", ts=None):
     """Append one message to memory/raw/{sid}/YYYY-MM-DD.md."""
     text = redact(text)
